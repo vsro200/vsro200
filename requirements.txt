@@ -1,0 +1,26 @@
+# Core PyTorch
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0       # also used for AVSR audio loading (evaluation/avsr/)
+numpy>=1.24.0
+
+# Video reading (decord2 = maintained fork of decord)
+decord2==3.0.0
+
+# HuggingFace for downloading the model
+huggingface_hub>=0.20.0
+
+# Whisper-style tokenizer (used by ro_vsr/tokenizer.py copied from MultiVSR)
+# Note: if you encounter HFValidationError when loading the local tokenizer,
+# downgrade with: pip install "transformers<4.45"
+transformers>=4.30.0
+
+# Transitive dependencies of ro_vsr/models.py (copied from MultiVSR)
+# Defines the encoder-decoder architecture with linear attention
+linear-attention-transformer>=0.19.0
+einops>=0.7.0
+
+# Utilities
+tqdm>=4.65.0
+jiwer>=3.0.0           # for WER/CER metrics (used by inference.py and inference_avsr.py)
+pandas>=2.0.0          # for reading metadata CSVs

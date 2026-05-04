@@ -1,0 +1,35 @@
+# Checkpoints (downloaded by setup.sh)
+checkpoints/
+ro_vsr/checkpoints/
+*.pth
+*.pt
+
+# Dataset (downloaded separately)
+data/
+
+# Code copied from MultiVSR at setup
+ro_vsr/models.py
+ro_vsr/tokenizer.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env_ro_vsr/
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs
+outputs/
+*.log
+predictions/
+__pycache__/ # dacă nu e deja acolo
