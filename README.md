@@ -26,7 +26,7 @@ Building upon the MultiVSR architecture, which we fine-tune with our data, we es
 
 ```bash
 git clone https://github.com/vsro200/vsro200.git
-cd ro-vsr
+cd vsro200
 bash scripts/setup.sh
 pip install -r requirements.txt
 ```
