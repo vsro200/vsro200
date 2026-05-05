@@ -16,8 +16,8 @@ the format:
 
 ```csv
 file_path,start,end,transcript,gender
-y7j5T-AHxTc/00001,12.450,28.180,"...",F
-y7j5T-AHxTc/00002,45.020,52.860,"...",F
+MfbPvQLQv54/00402,78.61,85.13,"...",M
+MfbPvQLQv54/00404,142.32,147.03,"...",M
 ```
 
 Where:
@@ -29,20 +29,22 @@ Where:
   `test_ood` split
 
 Available splits:
-| Split | Description | Extra columns |
-| --- | --- | --- |
-| `trainval_annot.csv` | Manually annotated train/val | gender |
-| `trainval_auto.csv` | Auto-transcribed train/val (Whisper-large) | gender |
-| `test_seen.csv` | Test split, speakers seen during training | gender |
-| `test_unseen.csv` | Test split, unseen speakers (TBD) | gender |
-| `test_ood.csv` | Out-of-domain test (different content type) | domain |
+
+| Split | Description | Duration | Extra columns |
+| :--- | :--- | :--- | :--- |
+| `trainval_annot.csv` | Manually annotated train/val | ~100h | gender |
+| `trainval_auto.csv` | Auto-transcribed train/val (Whisper-large) | ~200h | gender |
+| `test_seen.csv` | Test split, speakers seen during training | ~1h | gender |
+| `test_unseen.csv` | Test split, unseen speakers | ~1h | gender |
+| `test_ood.csv` | Out-of-domain test (different content type) | ~1h | domain |
 
 ## Reconstruction workflow
 
 ### Dependencies
 
 ```bash
-pip install yt-dlp pandas
+pip install yt-dlp pandas "huggingface_hub[cli]"
+pip install scenedetect==0.6.6 face-alignment python-speech-features
 ```
 
 You'll also need `ffmpeg` available on your system PATH.
@@ -52,14 +54,15 @@ You'll also need `ffmpeg` available on your system PATH.
 Pick whichever splits you need.
 
 ```bash
-pip install -U "huggingface_hub[cli]"
+git clone https://github.com/vsro200/vsro200.git
+cd vsro200/dataset
 
 # Download a single split
-huggingface-cli download vsro200/vsro200 test_unseen.csv \
+hf download vsro200/vsro200 test_seen.csv \
     --repo-type dataset --local-dir ./
 
 # Or download all CSVs at once
-huggingface-cli download vsro200/vsro200 \
+hf download vsro200/vsro200 \
     --repo-type dataset --local-dir ./ \
     --include "*.csv"
 ```
@@ -110,15 +113,20 @@ input, run them through MultiVSR's preprocessing pipeline.
 
 ```bash
 git clone https://github.com/Sindhu-Hegde/multivsr.git /tmp/multivsr
-cd /tmp/multivsr/preprocess
 
-for clip in /path/to/clips/test_seen/*/*.mp4; do
-    youtube_id=$(dirname "$clip" | xargs basename)
-    clip_index=$(basename "$clip" .mp4)
-    python run_pipeline.py \
-        --videofile "$clip" \
+WORK_DIR=$(pwd)
+FACE_TRACKS_ABS_PATH="${WORK_DIR}/face_tracks"
+
+for clip_relative_path in clips/test_seen/*/*.mp4; do
+    clip_absolute_path=$(realpath "$clip_relative_path")
+
+    youtube_id=$(basename "$(dirname "$clip_absolute_path")")
+    clip_index=$(basename "$clip_absolute_path" .mp4)
+
+    (cd /tmp/multivsr/preprocess && python run_pipeline.py \
+        --videofile "$clip_absolute_path" \
         --reference "${youtube_id}/${clip_index}" \
-        --data_dir /path/to/face_tracks/test_seen/
+        --data_dir "$FACE_TRACKS_ABS_PATH")
 done
 ```
 
