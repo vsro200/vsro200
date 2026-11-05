@@ -1,29 +1,33 @@
 """
 Single-clip AVSR (Audio-Visual Speech Recognition) inference.
 
-Combines our VSR model (video) with a fine-tuned Whisper model (audio)
-via shallow fusion at the log-probability level.
+Combines our VSR model (video) with a fine-tuned Whisper model (audio).
+At every decoding step the two next-token distributions are mixed with a
+weight computed from their entropies, so the branch that is less certain at
+that step counts for less (see beam_search_fusion.py).
 
 The VSR model uses the MultiVSR architecture (Prajwal et al., 2025),
 trained on our VSRo-200 dataset.
 
 Example usage:
-    python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR0.mp4
-    python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR0.mp4 --mode whisper
-    python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR0.mp4 --mode multivsr
+    python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR-5.avi
+    python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR-5.avi --mode audio
+    python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR-5.avi --mode all
 
-Input clips must be MP4 files with:
-  - 160x160 video (face crop)
-  - audio track (any sample rate; resampled to 16 kHz internally)
+Input clips must be .avi or .mp4 files with:
+  - a face-cropped video track (resized to 160x160, then centre-cropped to 96x96)
+  - an audio track (mono 16 kHz is used as is; anything else is converted)
 
-For demo purposes, our `samples_avsr/` clips have noise pre-mixed into
-the audio track. To evaluate on your own clips, simply provide an MP4
-with the same video format.
+The clips in `samples_avsr/` already carry noise in their audio track. The
+video is the clean face crop; only the audio is degraded.
 """
 
 import argparse
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import warnings
 
@@ -32,19 +36,18 @@ warnings.filterwarnings("ignore", message=".*CUDA is not available.*")
 
 import numpy as np
 import torch
-import torchaudio
 from huggingface_hub import hf_hub_download
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import WhisperFeatureExtractor, WhisperForConditionalGeneration
 
-# Add the repository root to path so we can import from ro_vsr/
+# Add the repository root to path so we can import from vsr_inference/
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 from vsr_inference.models import build_model, build_visual_encoder
 from vsr_inference.tokenizer import get_tokenizer
-from vsr_inference.metrics import lookup_reference, print_metrics_block
+from vsr_inference.metrics import compute_wer_cer, lookup_reference, print_metrics_block
 
-from beam_search_fusion import beam_search_fusion
+from beam_search_fusion import MODES, beam_search_fusion
 
 
 # ============================================================
@@ -58,6 +61,8 @@ DEFAULT_VTP_PATH = os.path.join(REPO_ROOT, "checkpoints/feature_extractor.pth")
 DEFAULT_METADATA = os.path.join(
     os.path.dirname(__file__), "samples_avsr", "samples_avsr_metadata.csv"
 )
+
+START_PROMPT = "<|startoftranscript|><|ro|><|transcribe|><|notimestamps|>"
 
 
 # ============================================================
@@ -88,7 +93,7 @@ def normalize_text(text: str) -> str:
 # ============================================================
 
 def read_video(fpath: str, device: torch.device) -> torch.Tensor:
-    """Read a 160x160 .mp4/.avi clip → tensor of shape [1, 3, T, 96, 96]."""
+    """Read a face-cropped .mp4/.avi clip -> tensor of shape [1, 3, T, 96, 96]."""
     from decord import VideoReader, bridge
     bridge.set_bridge("native")
 
@@ -108,16 +113,59 @@ def read_video(fpath: str, device: torch.device) -> torch.Tensor:
     return frames[:, :, :, crop_x:crop_x + 96, crop_y:crop_y + 96]
 
 
+def _read_audio_ffmpeg(fpath: str, target_sr: int) -> torch.Tensor:
+    """Decode the audio track with ffmpeg into float32 samples, mono.
+
+    Samples are requested as 32-bit float, so a float track is returned bit
+    for bit, and an integer track gets the same scaling torchaudio applies.
+    Channels are averaged here rather than by ffmpeg, whose downmix matrix
+    does not always weight them equally.
+    """
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        raise RuntimeError("Reading audio needs either a working torchaudio.load "
+                           "or ffmpeg/ffprobe on PATH.")
+
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=channels,sample_rate", "-of", "json", fpath],
+        capture_output=True, text=True,
+    )
+    streams = json.loads(probe.stdout or "{}").get("streams", [])
+    if not streams:
+        raise RuntimeError(f"No audio track in {fpath}")
+    channels = int(streams[0]["channels"])
+
+    cmd = ["ffmpeg", "-v", "error", "-i", fpath, "-vn", "-f", "f32le"]
+    if int(streams[0]["sample_rate"]) != target_sr:
+        cmd += ["-ar", str(target_sr)]
+    cmd.append("pipe:1")
+    out = subprocess.run(cmd, capture_output=True)
+    if out.returncode != 0:
+        raise RuntimeError(f"ffmpeg could not decode the audio of {fpath}:\n"
+                           f"{out.stderr.decode(errors='replace')}")
+
+    samples = np.frombuffer(out.stdout, dtype="<f4").reshape(-1, channels)
+    return torch.from_numpy(samples.mean(axis=1).astype(np.float32))
+
+
 def read_audio(fpath: str, target_sr: int = 16000) -> torch.Tensor:
-    """Read audio track from a video file → mono 16 kHz tensor of shape [T]."""
-    waveform, sr = torchaudio.load(fpath)
+    """Read the audio track of a video file -> mono 16 kHz tensor of shape [T].
+
+    torchaudio is tried first. Recent torchaudio versions moved decoding to a
+    separate package (torchcodec), so where `torchaudio.load` is unavailable
+    the track is decoded with ffmpeg instead.
+    """
+    try:
+        import torchaudio
+        waveform, sr = torchaudio.load(fpath)
+    except Exception as e:
+        print(f"[audio] torchaudio could not read the file ({type(e).__name__}); "
+              f"decoding with ffmpeg")
+        return _read_audio_ffmpeg(fpath, target_sr)
+
     if sr != target_sr:
         waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-    if waveform.size(0) > 1:
-        waveform = waveform.mean(dim=0)
-    else:
-        waveform = waveform.squeeze(0)
-    return waveform
+    return waveform.mean(dim=0)
 
 
 # ============================================================
@@ -156,12 +204,17 @@ def load_vsr_models(vsr_filename: str, vtp_path: str, device: torch.device):
 
 
 def load_whisper(whisper_repo: str, device: torch.device):
-    """Load a fine-tuned Whisper model + its processor."""
+    """Load the fine-tuned Whisper model and its feature extractor.
+
+    Only the feature extractor (audio -> log-mel) is needed: decoding uses the
+    MultiVSR tokenizer, shared by both branches. Loading the full
+    WhisperProcessor would also load Whisper's own tokenizer for nothing.
+    """
     print(f"[load] Downloading Whisper from {whisper_repo} ...")
     whisper_model = WhisperForConditionalGeneration.from_pretrained(whisper_repo).to(device)
     whisper_model.eval()
-    whisper_processor = WhisperProcessor.from_pretrained(whisper_repo)
-    return whisper_model, whisper_processor
+    feature_extractor = WhisperFeatureExtractor.from_pretrained(whisper_repo)
+    return whisper_model, feature_extractor
 
 
 # ============================================================
@@ -174,22 +227,26 @@ def run_inference(
     vsr_model,
     visual_encoder,
     whisper_model,
-    whisper_processor,
+    feature_extractor,
     tokenizer,
     device: torch.device,
-    mode: str = "hibrid_logp",
+    modes=("fusion",),
     beam_size: int = 5,
     max_len: int = 256,
-) -> str:
-    """Run a single AVSR forward pass and return the cleaned transcription."""
-    start_prompt_ids = tokenizer.encode(
-        "<|startoftranscript|><|ro|><|transcribe|><|notimestamps|>"
-    )
+) -> dict:
+    """Encode the clip once, then decode it in each requested mode.
+
+    Returns {mode: (transcription, mean_alpha)}; mean_alpha is None outside
+    fusion mode. Autocast wraps the decoding as well as the encoders, as in
+    the evaluation reported in the paper.
+    """
+    start_prompt_ids = tokenizer.encode(START_PROMPT)
+    results = {}
 
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             # Audio path: Whisper encoder
-            mel = whisper_processor(
+            mel = feature_extractor(
                 audio.cpu().numpy(), sampling_rate=16000, return_tensors="pt"
             ).input_features.to(device)
             audio_embeds = whisper_model.model.encoder(mel).last_hidden_state
@@ -200,30 +257,38 @@ def run_inference(
             src_mask = torch.ones((B, 1, T), device=device).bool()
             video_memory, _ = vsr_model.encode(vid_emb, src_mask)
 
-            # Beam search with shallow fusion
-            beam_outs, _ = beam_search_fusion(
-                whisper_model=whisper_model.model,
-                whisper_proj=whisper_model.proj_out,
-                audio_embeds=audio_embeds,
-                multivsr_model=vsr_model,
-                video_memory=video_memory,
-                src_mask=src_mask,
-                bos_indices=start_prompt_ids,
-                eos_index=tokenizer.eot,
-                pad_index=0,
-                max_output_length=max_len,
-                size=beam_size,
-                n_best=1,
-                mode=mode,
-            )
+            for mode in modes:
+                stats = {} if mode == "fusion" else None
+                beam_outs, _ = beam_search_fusion(
+                    whisper_model=whisper_model.model,
+                    whisper_proj=whisper_model.proj_out,
+                    audio_embeds=audio_embeds,
+                    multivsr_model=vsr_model,
+                    video_memory=video_memory,
+                    src_mask=src_mask,
+                    bos_indices=start_prompt_ids,
+                    eos_index=tokenizer.eot,
+                    pad_index=0,
+                    max_output_length=max_len,
+                    size=beam_size,
+                    n_best=1,
+                    mode=mode,
+                    stats=stats,
+                )
 
-    if not beam_outs[0]:
-        return ""
-    best_ids = beam_outs[0][0]
-    if isinstance(best_ids, torch.Tensor):
-        best_ids = best_ids.tolist()
+                if not beam_outs[0]:
+                    text = ""
+                else:
+                    best_ids = beam_outs[0][0]
+                    if isinstance(best_ids, torch.Tensor):
+                        best_ids = best_ids.tolist()
+                    text = clean_prediction(tokenizer.decode(best_ids))
 
-    return clean_prediction(tokenizer.decode(best_ids))
+                alpha = (float(np.mean(stats["alpha"]))
+                         if stats and stats.get("alpha") else None)
+                results[mode] = (text, alpha)
+
+    return results
 
 
 # ============================================================
@@ -232,20 +297,20 @@ def run_inference(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Single-clip AVSR inference with shallow fusion",
+        description="Single-clip AVSR inference with entropy-weighted fusion",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--fpath", type=str, required=True,
-                        help="Path to the input video file (.mp4 or .avi, 160x160 with audio)")
+                        help="Path to the input video file (.avi or .mp4, face crop with audio)")
     parser.add_argument("--vsr_model", type=str, default=DEFAULT_VSR_MODEL_FILENAME,
-                    help="Checkpoint filename in vsro200/models-vsro200 (e.g. model_200h_auto.pt)")
+                        help="Checkpoint filename in vsro200/models-vsro200 (e.g. model_200h_auto.pt)")
     parser.add_argument("--whisper_model", type=str, default=DEFAULT_WHISPER_MODEL,
                         help="HuggingFace repo for the Whisper model")
     parser.add_argument("--vtp_path", type=str, default=DEFAULT_VTP_PATH,
                         help="Path to the VTP feature extractor checkpoint")
-    parser.add_argument("--mode", type=str, default="hibrid_logp",
-                        choices=["hibrid_logp", "whisper", "multivsr"],
-                        help="Decoding mode: shallow fusion, audio-only, or video-only")
+    parser.add_argument("--mode", type=str, default="fusion",
+                        choices=list(MODES) + ["all"],
+                        help="fusion, audio only, video only, or all three on the same clip")
     parser.add_argument("--beam_size", type=int, default=5)
     parser.add_argument("--max_len", type=int, default=256)
     parser.add_argument("--metadata", type=str, default=DEFAULT_METADATA,
@@ -263,8 +328,8 @@ def main():
     # Load
     tokenizer = get_tokenizer()
     vsr_model, visual_encoder = load_vsr_models(args.vsr_model, args.vtp_path, device)
-    whisper_model, whisper_processor = load_whisper(args.whisper_model, device)
-    print(f"[load] ✅ All models loaded successfully")
+    whisper_model, feature_extractor = load_whisper(args.whisper_model, device)
+    print("[load] All models loaded")
 
     # Read
     video = read_video(args.fpath, device)
@@ -273,27 +338,48 @@ def main():
     print(f"[audio] Samples loaded:   {audio.shape[0]} ({audio.shape[0]/16000:.2f}s @ 16 kHz)")
 
     # Inference
+    modes = list(MODES) if args.mode == "all" else [args.mode]
     print(f"[infer] Running inference (mode={args.mode}) ...")
-    transcription = run_inference(
+    results = run_inference(
         video=video,
         audio=audio,
         vsr_model=vsr_model,
         visual_encoder=visual_encoder,
         whisper_model=whisper_model,
-        whisper_processor=whisper_processor,
+        feature_extractor=feature_extractor,
         tokenizer=tokenizer,
         device=device,
-        mode=args.mode,
+        modes=modes,
         beam_size=args.beam_size,
         max_len=args.max_len,
     )
 
+    reference = lookup_reference(args.metadata, args.fpath)
     print("─" * 70)
     print(f"File:           {args.fpath}")
-    print(f"Mode:           {args.mode}")
-    print(f"Transcription:  {transcription}")
-    reference = lookup_reference(args.metadata, args.fpath)
-    print_metrics_block(reference, transcription, normalize_text)
+
+    if args.mode != "all":
+        text, alpha = results[args.mode]
+        print(f"Mode:           {args.mode}")
+        print(f"Transcription:  {text}")
+        if alpha is not None:
+            print(f"Mean alpha:     {alpha:.3f}  (weight of the audio branch)")
+        print_metrics_block(reference, text, normalize_text)
+    else:
+        if reference is not None:
+            print(f"Reference:      {reference}")
+        for mode in modes:
+            text, alpha = results[mode]
+            print()
+            print(f"[{mode}]")
+            print(f"  Transcription:  {text}")
+            if reference is not None:
+                wer, cer = compute_wer_cer(normalize_text(reference),
+                                           normalize_text(text))
+                if wer is not None:
+                    print(f"  WER / CER:      {wer * 100:.2f}% / {cer * 100:.2f}%")
+            if alpha is not None:
+                print(f"  Mean alpha:     {alpha:.3f}  (weight of the audio branch)")
     print("─" * 70)
 
 

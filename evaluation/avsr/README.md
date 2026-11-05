@@ -1,8 +1,8 @@
 # Audio-Visual Speech Recognition (AVSR)
 
 This folder contains the AVSR experiments reported in the paper:
-**Shallow fusion between our VSR model (video) and a fine-tuned Whisper
-model (audio) under noisy conditions.**
+**decoding-time fusion of our VSR model (video) with a fine-tuned Whisper
+model (audio), under noisy conditions.**
 
 The VSR model uses the [MultiVSR](https://github.com/Sindhu-Hegde/multivsr)
 architecture (Prajwal et al., 2025), trained on our VSRo-200 dataset.
@@ -13,11 +13,26 @@ substantially improves over audio-only (Whisper) decoding.
 
 ## Architecture
 
-![AVSR shallow fusion architecture](avsr.png)
+![AVSR fusion architecture](avsr.png)
 
-At each decoding step, we combine the next-token log-probabilities from
-Whisper (audio branch) and from our VSR encoder-decoder (video branch),
-then perform standard beam search on the averaged distribution.
+At each decoding step, both branches produce a probability distribution over
+the next token. The weight of the audio branch is computed from the Shannon
+entropy of the two distributions:
+
+$$\alpha = \frac{H(P_{\text{video}})}{H(P_{\text{audio}}) + H(P_{\text{video}})}$$
+
+and the fused distribution is
+
+$$P_{\text{fused}} = \alpha \, P_{\text{audio}} + (1 - \alpha) \, P_{\text{video}}$$
+
+The branch that is less certain at that step counts for less. As noise
+increases, Whisper's distribution flattens, its entropy rises, $\alpha$ falls,
+and the video branch carries more of the decision. $\alpha$ is recomputed for
+every token and every beam. Beam search then runs on $\log P_{\text{fused}}$.
+
+The audio-only and video-only baselines use the same beam search, so the
+difference between the three modes comes from the information available,
+not from the decoder.
 
 ## Quick start
 
@@ -25,76 +40,56 @@ From the repository root, after running the main `bash scripts/setup.sh`:
 
 ```bash
 cd evaluation/avsr
-python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR-5.mp4
+python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR-5.avi --mode all
 ```
-
-Expected output (on the first demo clip, with the default `hibrid_logp`
-fusion mode):
-
-```
-[device] cuda
-[load] Downloading VSR model from vsro200/models-vsro200/checkpoints/model_200h_auto.pt ...
-[load] Downloading Whisper from vsro200/whisper-small-vsro200 ...
-[load] ✅ All models loaded successfully
-[video] Frames extracted: (1, 3, 222, 96, 96)
-[audio] Samples loaded:   140288 (8.77s @ 16 kHz)
-[infer] Running inference (mode=hibrid_logp) ...
-──────────────────────────────────────────────────────────────────────
-File:           samples_avsr/sample_1_babble_SNR-5.mp4
-Mode:           hibrid_logp
-Transcription:  mi-au greșit prieteni foarte apropiați cărora eu nu le-am găsit explicații de ce au făcut asta eu nu le-am greșit nu le niciodată
-Reference:      mi-au greșit prieteni foarte apropiați cărora eu nu le-am găsit explicații de ce au făcut asta eu negreșindu-le niciodată
-WER:            26.32%
-CER:            9.09%
-──────────────────────────────────────────────────────────────────────
-```
-
 
 ## Decoding modes
 
 The `--mode` flag selects how predictions are produced:
 
-- **`hibrid_logp`** (default): shallow fusion at the log-probability
-  level at each decoding step.
-- **`whisper`**: audio-only baseline (Whisper alone).
-- **`multivsr`**: video-only baseline (our VSR model alone).
+- **`fusion`** (default): entropy-weighted fusion of both branches.
+- **`audio`**: audio-only baseline (Whisper alone).
+- **`video`**: video-only baseline (our VSR model alone).
+- **`all`**: the three above on the same clip, with the models loaded once.
 
-To compare all three on the same clip:
-
-```bash
-for mode in whisper multivsr hibrid_logp; do
-    python inference_avsr.py --fpath samples_avsr/sample_1_babble_SNR-5.mp4 --mode $mode
-done
-```
+In fusion mode the script also prints the mean $\alpha$ over the decoding
+steps, i.e. the average share of the audio branch.
 
 ## Demo samples
 
-We provide 5 demo MP4 clips with noise pre-mixed into the audio track
-at varying SNRs. The video remains a clean face crop; only the
-audio is degraded. This means the same clip can be decoded with all
-three modes to directly observe the effect of fusion.
+We provide 6 samples built from 3 clips of the unseen-speaker test split,
+each clip once with babble and once with Gaussian noise mixed into the audio
+track. The video is the clean face crop; only the audio is
+degraded. The noise is the exact realisation used in the paper's evaluation
+(Gaussian noise seeded per clip; babble from 4 [MUSAN](https://www.openslr.org/17/)
+speakers selected per clip), and the audio is stored as uncompressed float
+PCM so that it is not altered by encoding. Decoding these clips therefore
+reproduces the per-clip results of the paper.
 
-| File | Noise | SNR | Reference (truncated) |
-| --- | --- | --- | --- |
-| `sample_1_babble_SNR-5.mp4` | babble (4-speaker) | −5 dB | "mi-au greșit prieteni foarte apropiați..." |
-| `sample_2_gaussian_SNR0.mp4` | gaussian (white) | 0 dB | "moment chimie însemnând să te uiți la omul ăla..." |
-| `sample_3_gaussian_SNR5.mp4` | gaussian (white) | 5 dB | "să nu eu nu țin ură nu țin pică..." |
-| `sample_4_babble_SNR10.mp4` | babble (4-speaker) | 10 dB | "iar oamenii de la care nu știu n-aveam așteptări..." |
-| `sample_5_babble_SNR15.mp4` | babble (4-speaker) | 15 dB | "mi-era tare drag de ei așa" |
+| File | Noise | SNR | WER audio | WER video | WER fusion |
+| --- | --- | --- | --- | --- | --- |
+| `sample_1_babble_SNR-5.avi` | babble (4 speakers) | −5 dB | 89.47% | 47.37% | 31.58% |
+| `sample_2_gaussian_SNR-5.avi` | Gaussian (white) | −5 dB | 78.95% | 47.37% | 36.84% |
+| `sample_3_babble_SNR-5.avi` | babble (4 speakers) | −5 dB | 84.21% | 63.16% | 36.84% |
+| `sample_4_gaussian_SNR0.avi` | Gaussian (white) | 0 dB | 47.37% | 63.16% | 36.84% |
+| `sample_5_babble_SNR5.avi` | babble (4 speakers) | 5 dB | 46.67% | 86.67% | 20.00% |
+| `sample_6_gaussian_SNR10.avi` | Gaussian (white) | 10 dB | 60.00% | 86.67% | 26.67% |
 
-Babble noise is sampled from [MUSAN](https://www.openslr.org/17/),
-mixed from 4 randomly selected speakers. Full reference transcriptions
-are in [`samples_avsr/samples_avsr_metadata.csv`](samples_avsr/samples_avsr_metadata.csv).
+Samples 1 and 2, 3 and 4, 5 and 6 share a clip, so the video-only result is
+the same within each pair. Fusion improves over both single-modality branches
+on all six, including samples 5 and 6, where the video branch alone is weak.
 
-
+Reference transcriptions, the source of each clip in the public dataset, the
+noise seed and the MUSAN files used for babble are listed in
+[`samples_avsr/samples_avsr_metadata.csv`](samples_avsr/samples_avsr_metadata.csv).
 
 ## CLI options
 
 ```
---fpath          Path to input video (.mp4 or .avi with audio track)
---vsr_model      HF repo for the VSR model (default: vsro200/models-vsro200/checkpoints/model_200h_auto.pt)
+--fpath          Path to input video (.avi or .mp4 with audio track)
+--vsr_model      Checkpoint filename in vsro200/models-vsro200 (default: model_200h_auto.pt)
 --whisper_model  HF repo for Whisper (default: vsro200/whisper-small-vsro200)
---mode           hibrid_logp | whisper | multivsr (default: hibrid_logp)
+--mode           fusion | audio | video | all (default: fusion)
 --beam_size      Beam size (default: 5)
 --max_len        Max output tokens (default: 256)
 --metadata       Metadata CSV for WER lookup (default: samples_avsr/samples_avsr_metadata.csv)

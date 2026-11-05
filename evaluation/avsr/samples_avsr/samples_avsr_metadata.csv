@@ -1,0 +1,7 @@
+file_path,reference,noise_type,snr_db,source,start,end,noise_seed,babble_files
+samples_avsr/sample_1_babble_SNR-5.avi,să știi că și el avea înclinație către muzică și eu trăiesc cu zilele trebuie să zicea mama zice,babble,-5,xPCn3PKlZ8A/36515,3214.23,3220.44,321,speech-librivox-0141.wav speech-us-gov-0027.wav speech-librivox-0064.wav speech-us-gov-0018.wav
+samples_avsr/sample_2_gaussian_SNR-5.avi,să știi că și el avea înclinație către muzică și eu trăiesc cu zilele trebuie să zicea mama zice,gaussian,-5,xPCn3PKlZ8A/36515,3214.23,3220.44,321,
+samples_avsr/sample_3_babble_SNR-5.avi,dar nu numai asta și fac tot posibilul și azi și maine și o să-l fac întotdeauna pentru orice,babble,-5,LIwL_Ooi5c4/28753,6854.89,6859.11,408,speech-us-gov-0235.wav speech-us-gov-0192.wav speech-us-gov-0052.wav speech-librivox-0135.wav
+samples_avsr/sample_4_gaussian_SNR0.avi,dar nu numai asta și fac tot posibilul și azi și maine și o să-l fac întotdeauna pentru orice,gaussian,0,LIwL_Ooi5c4/28753,6854.89,6859.11,408,
+samples_avsr/sample_5_babble_SNR5.avi,așa când văd o scenă de aia înțelegi zic aulăleu ce m-au păcălit gata serialul,babble,5,6JaCIsoexiM/04770,3930.77,3935.88,99,speech-us-gov-0033.wav speech-us-gov-0021.wav speech-librivox-0102.wav speech-us-gov-0133.wav
+samples_avsr/sample_6_gaussian_SNR10.avi,așa când văd o scenă de aia înțelegi zic aulăleu ce m-au păcălit gata serialul,gaussian,10,6JaCIsoexiM/04770,3930.77,3935.88,99,

@@ -1,20 +1,38 @@
 """
-Beam search with shallow fusion between Whisper (audio) and VSRo (video).
+Beam search with confidence-weighted fusion of Whisper (audio) and VSRo (video).
 
-Fusion modes:
-  - "hibrid_logp": shallow fusion at log-prob level (Whisper + VSR averaged
-                   in log-probability space). This is the main reported method.
-  - "whisper":     audio-only baseline (Whisper alone).
-  - "multivsr":    video-only baseline (VSR alone).
+Decoding modes:
+  - "fusion": at every step, both branches give a distribution over the next
+              token. The weight of the audio branch is
+
+                  alpha = H(P_video) / (H(P_audio) + H(P_video))
+
+              where H is the Shannon entropy, and the fused distribution is
+
+                  P_fused = alpha * P_audio + (1 - alpha) * P_video.
+
+              The branch that is less certain at that step counts for less,
+              and alpha is recomputed for every token and every beam.
+  - "audio":  audio-only baseline (Whisper alone).
+  - "video":  video-only baseline (the VSR model alone).
+
+All three modes share this decoder, so differences between them come from
+the information available, not from the search procedure.
 
 Decoder structure follows MultiVSR's beam search (search.py), with the
-modification that the next-token log-probabilities are computed by combining
-both modalities at each step.
+modification that the next-token distribution is computed from both
+modalities at each step.
 """
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+MODES = ("fusion", "audio", "video")
+
+# Added inside every log and every entropy, so that a token with zero
+# probability in both branches does not produce -inf or NaN.
+EPS = 1e-8
 
 
 def tile(x, count, dim=0):
@@ -49,29 +67,38 @@ def subsequent_mask(size: int) -> torch.Tensor:
 def beam_search_fusion(
     whisper_model,        # WhisperForConditionalGeneration.model (encoder + decoder)
     whisper_proj,         # WhisperForConditionalGeneration.proj_out
-    audio_embeds,         # (1, T_a, D_a) — Whisper encoder output
+    audio_embeds,         # (1, T_a, D_a) : Whisper encoder output
     multivsr_model,       # the encoder-decoder VSR model
-    video_memory,         # (1, T_v, D_v) — VSR encoder output
-    src_mask,             # (1, 1, T_v) — VSR encoder mask
+    video_memory,         # (1, T_v, D_v) : VSR encoder output
+    src_mask,             # (1, 1, T_v) : VSR encoder mask
     bos_indices,          # list of BOS token IDs (start-of-transcript prompt)
     eos_index,            # EOS token ID
     pad_index,            # PAD token ID (typically 0)
     max_output_length,    # maximum tokens to generate
     size=5,               # beam size
-    alpha=1.0,            # length penalty exponent
+    length_penalty_alpha=1.0,  # GNMT length penalty exponent, not the fusion weight
     n_best=1,             # number of hypotheses to return
-    mode="hibrid_logp",   # "hibrid_logp" | "whisper" | "multivsr"
+    mode="fusion",        # "fusion" | "audio" | "video"
+    stats=None,           # optional dict; in fusion mode, collects per-step
+                          # mean alpha and entropies of both branches
 ):
     """
-    Beam search decoding with shallow fusion. Supports three modes:
+    Beam search decoding over the audio, video or fused distribution.
 
-    - "hibrid_logp": at each step, log_probs = (log_softmax(whisper_logits)
-                     + log_softmax(vsr_logits)) / 2
-    - "whisper":     log_probs = log_softmax(whisper_logits)
-    - "multivsr":    log_probs = log_softmax(vsr_logits)
+    - "fusion": P_fused = alpha * P_audio + (1 - alpha) * P_video, with
+                alpha = H(P_video) / (H(P_audio) + H(P_video)) per step
+    - "audio":  log_softmax(whisper_logits)
+    - "video":  log_softmax(vsr_logits)
+
+    `length_penalty_alpha` is the exponent of the GNMT length normalisation
+    applied when ranking hypotheses. It has nothing to do with the fusion
+    weight alpha above.
 
     Currently supports batch_size=1 only.
     """
+    if mode not in MODES:
+        raise ValueError(f"Unknown mode {mode!r}; expected one of {MODES}")
+
     batch_size = src_mask.size(0)
     assert batch_size == 1, "Currently only batch_size=1 is supported"
 
@@ -106,18 +133,17 @@ def beam_search_fusion(
         decoder_input = alive_seq
 
         # ── Whisper logits ────────────────────────────────────────────
-        if mode != "multivsr":
+        if mode != "video":
             out_audio = whisper_model.decoder(
                 input_ids=decoder_input,
                 encoder_hidden_states=audio_embeds,
             )
             logits_audio = whisper_proj(out_audio.last_hidden_state[:, -1])
-            logp_audio = F.log_softmax(logits_audio, dim=-1)
         else:
-            logp_audio = None
+            logits_audio = None
 
         # ── VSR logits ───────────────────────────────────────────────
-        if mode != "whisper":
+        if mode != "audio":
             tgt_mask = subsequent_mask(decoder_input.size(1)).to(device).long()
             logits_video = multivsr_model.decode(
                 video_memory, src_mask, decoder_input, tgt_mask
@@ -126,21 +152,46 @@ def beam_search_fusion(
                 (decoder_input.size(0), -1, logits_video.size(-1))
             )
             logits_video = logits_video[:, -1]
-            logp_video = F.log_softmax(logits_video, dim=-1)
         else:
-            logp_video = None
+            logits_video = None
 
-        # ── Fusion ───────────────────────────────────────────────────
-        if mode == "whisper":
-            log_probs = logp_audio
-        elif mode == "multivsr":
-            log_probs = logp_video
-        elif mode == "hibrid_logp":
-            # Align vocab sizes if Whisper and VSR differ slightly (rare)
-            min_vocab = min(logp_audio.size(-1), logp_video.size(-1))
-            log_probs = (logp_audio[:, :min_vocab] + logp_video[:, :min_vocab]) / 2.0
+        # ── Next-token distribution ──────────────────────────────────
+        if mode == "audio":
+            log_probs = F.log_softmax(logits_audio, dim=-1)
+        elif mode == "video":
+            log_probs = F.log_softmax(logits_video, dim=-1)
         else:
-            raise ValueError(f"Unknown fusion mode: {mode}")
+            # Both models use the same multilingual Whisper tokenizer, so the
+            # two vocabularies are index for index the same. If they ever were
+            # not, averaging probabilities would mix unrelated tokens, which is
+            # worse than failing.
+            if logits_audio.size(-1) != logits_video.size(-1):
+                raise ValueError(
+                    f"Vocabulary sizes differ: audio {logits_audio.size(-1)}, "
+                    f"video {logits_video.size(-1)}. Fusion needs the same "
+                    "tokenizer on both branches."
+                )
+
+            probs_audio = F.softmax(logits_audio, dim=-1)
+            probs_video = F.softmax(logits_video, dim=-1)
+
+            # Entropy of each branch at this step, one value per beam.
+            ent_audio = -torch.sum(probs_audio * torch.log(probs_audio + EPS),
+                                   dim=-1, keepdim=True)
+            ent_video = -torch.sum(probs_video * torch.log(probs_video + EPS),
+                                   dim=-1, keepdim=True)
+
+            # Weight of the audio branch: large when the video branch is the
+            # more uncertain one, small when audio is.
+            alpha_fuse = ent_video / (ent_audio + ent_video + EPS)
+
+            if stats is not None:
+                stats.setdefault("alpha", []).append(alpha_fuse.mean().item())
+                stats.setdefault("ent_audio", []).append(ent_audio.mean().item())
+                stats.setdefault("ent_video", []).append(ent_video.mean().item())
+
+            probs_fused = alpha_fuse * probs_audio + (1 - alpha_fuse) * probs_video
+            log_probs = torch.log(probs_fused + EPS)
 
         # ── Standard beam search expansion ───────────────────────────
         log_probs += topk_log_probs.view(-1).unsqueeze(1)
@@ -148,14 +199,14 @@ def beam_search_fusion(
 
         output_size = log_probs.size(-1)
 
-        if alpha > -1:
-            length_penalty = ((5.0 + (step + 1)) / 6.0) ** alpha
+        if length_penalty_alpha > -1:
+            length_penalty = ((5.0 + (step + 1)) / 6.0) ** length_penalty_alpha
             curr_scores /= length_penalty
 
         curr_scores = curr_scores.reshape(-1, size * output_size)
         topk_scores, topk_ids = curr_scores.topk(size, dim=-1)
 
-        if alpha > -1:
+        if length_penalty_alpha > -1:
             topk_log_probs = topk_scores * length_penalty
         else:
             topk_log_probs = topk_scores.clone()
