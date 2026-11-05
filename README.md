@@ -77,8 +77,9 @@ For additional out-of-distribution (OOD) examples and complete metadata (includi
 ### Audio-visual fusion (AVSR)
 
 We combine the VSR encoder-decoder with a Romanian-tuned Whisper-small
-(`vsro200/whisper-small-vsro200`) using shallow log-probability fusion
-during decoding. See [`evaluation/avsr/`](evaluation/avsr/) for inference code and sample inputs.
+(`vsro200/whisper-small-vsro200`) at each decoding step, weighting the two
+next-token distributions by their entropy so that the less certain branch
+counts for less. See [`evaluation/avsr/`](evaluation/avsr/) for inference code and sample inputs.
 
 ### Word-level classification on LRRo
 
@@ -99,10 +100,11 @@ do not need to run any of this code to use the released artifacts.
 If you use this code, the models, or the VSRo-200 dataset, please cite:
 
 ```bibtex
-@inproceedings{[id]2026vsro200,
-    author    = "",
-    title     = "VSRo-200: A Romanian Visual Speech Recognition Dataset for Studying Supervision and Multimodal Robustness",
-    year      = "2026"
+@inproceedings{udrea2026vsro200,
+  title     = {{VSRo-200}: A {R}omanian Visual Speech Recognition Dataset for Studying Supervision and Multimodal Robustness},
+  author    = {Udrea, Iulia-Maria and Diaconu, Alexandra and Alexe, Bogdan},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS), Track on Evaluations and Datasets},
+  year      = {2026}
 }
 ```
 
