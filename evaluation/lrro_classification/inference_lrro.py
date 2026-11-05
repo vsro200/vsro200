@@ -22,6 +22,10 @@ Example usage:
     # Use 96_resize + Wild MLP:
     python inference_lrro.py --clip_dir /path/to/clip --strategy 96_resize --split wild
 
+Class names come from lrro_lab_classes.json and lrro_wild_classes.json in
+this folder: the alphabetical order of the word folders across LRRo's train,
+val and test splits, which is how the label indices were built in training.
+
 LRRo dataset must be obtained separately from the official source:
     https://bionescu.aimultimedialab.ro/LRRo.html
 """
@@ -31,7 +35,6 @@ import json
 import os
 import sys
 import warnings
-from typing import Optional
 
 # Suppress autocast warnings on CPU
 warnings.filterwarnings("ignore", message=".*CUDA is not available.*")
@@ -61,107 +64,50 @@ VTP_PATH = os.path.join(REPO_ROOT, "checkpoints/feature_extractor.pth")  # fixed
 DEFAULT_STRATEGY = "64_bottom"
 DEFAULT_SPLIT = "lab"
 
-# MLP hyperparameters
-HIDDEN_DIM = 512
-DROPOUT = 0.5
-
 
 # ============================================================
 # LRRo VOCABULARIES
 # ============================================================
-# These match the splits in the LRRo dataset (Jitaru et al., 2020).
-# LAB has 48 word classes, WILD has 21.
-#
-# We list them alphabetically (matching `sorted(...)` from training)
-# so that class index → word lookup matches the trained MLP exactly.
+# LAB has 48 word classes, WILD has 21, each including a `distractor` class.
+# Training indexed them as sorted(set of word folders) over the train, val
+# and test splits together. The two JSON files store exactly that mapping,
+# {word: index}, so the labels do not depend on how a user's copy of LRRo
+# is laid out.
 
-LRRO_LAB_WORDS = sorted([
-    # Will be populated automatically from the MLP head if available;
-    # see resolve_class_names() below.
-])
-
-LRRO_WILD_WORDS = sorted([])
+CLASS_MAP_FILES = {
+    "lab": os.path.join(os.path.dirname(os.path.abspath(__file__)), "lrro_lab_classes.json"),
+    "wild": os.path.join(os.path.dirname(os.path.abspath(__file__)), "lrro_wild_classes.json"),
+}
 
 
-def auto_detect_class_map(clip_dir: str, split: str) -> Optional[list]:
+def resolve_class_names(num_classes: int, split: str,
+                        class_map_file: str = None) -> tuple:
     """
-    Try to detect the class-to-index mapping from the LRRo dataset
-    structure, given a clip path.
+    Returns (class_names, source), where class_names[i] is the word for
+    output i of the MLP.
 
-    Expected LRRo layout:
-        <lrro_root>/<DatasetName>/(train|val|test)/<word>/<clip_id>/*.jpg
-
-    where <DatasetName> is 'Lab_LRRo_data_set' or 'Wild_LRRo_data_set'.
-
-    Returns the alphabetically sorted list of word folders found in
-    `train/` (matches the `sorted(...)` ordering used during training).
-    Returns None if the structure does not match.
+    Uses --class_map if given, otherwise the JSON file bundled for the split.
+    Accepts {word: index} or {index: word}. A list whose length differs from
+    the MLP's output size is an error, not a warning: the predictions would
+    still look plausible, just attached to the wrong words.
     """
-    # Walk up: clip_id -> word -> split (train/val/test) -> dataset
-    # clip_dir might end with a trailing slash, normalize first
-    clip_dir = os.path.normpath(clip_dir)
-    parts = clip_dir.split(os.sep)
-    if len(parts) < 4:
-        return None
+    path = class_map_file or CLASS_MAP_FILES[split]
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Class map not found: {path}")
 
-    # The dataset folder is the one whose name contains 'LRRo_data_set'
-    dataset_idx = None
-    for i, p in enumerate(parts):
-        if "LRRo_data_set" in p and (
-            ("Lab" in p and split == "lab") or ("Wild" in p and split == "wild")
-        ):
-            dataset_idx = i
-            break
-    if dataset_idx is None:
-        return None
+    with open(path, encoding="utf-8") as f:
+        mapping = json.load(f)
+    if all(str(k).isdigit() for k in mapping.keys()):
+        names = [mapping[str(i)] for i in range(len(mapping))]
+    else:
+        names = sorted(mapping.keys(), key=lambda w: mapping[w])
 
-    dataset_dir = os.sep.join(parts[: dataset_idx + 1])
-    train_dir = os.path.join(dataset_dir, "train")
-    if not os.path.isdir(train_dir):
-        return None
-
-    words = sorted(
-        d for d in os.listdir(train_dir)
-        if os.path.isdir(os.path.join(train_dir, d))
-    )
-    return words if words else None
-
-
-def resolve_class_names(num_classes: int, split: str, clip_dir: str = None,
-                       class_map_file: str = None) -> tuple:
-    """
-    Returns (class_names, source_description).
-
-    Resolution order:
-      1. --class_map JSON file if provided
-      2. Auto-detect from LRRo folder structure (if clip_dir is in an LRRo tree)
-      3. Fall back to generic 'class_<i>' labels
-
-    The number of classes from the MLP is used to validate the resolved
-    list — if it doesn't match, we fall back to generic labels.
-    """
-    # 1. Explicit mapping file
-    if class_map_file and os.path.isfile(class_map_file):
-        with open(class_map_file) as f:
-            mapping = json.load(f)
-        if all(str(k).isdigit() for k in mapping.keys()):
-            names = [mapping[str(i)] for i in range(num_classes)]
-        else:
-            names = sorted(mapping.keys(), key=lambda w: mapping[w])
-        if len(names) == num_classes:
-            return names, f"loaded from {class_map_file}"
-
-    # 2. Auto-detect from LRRo folder structure
-    if clip_dir is not None:
-        names = auto_detect_class_map(clip_dir, split)
-        if names and len(names) == num_classes:
-            return names, "auto-detected from LRRo folder structure"
-        elif names:
-            print(f"[warn] auto-detected {len(names)} classes from folder "
-                  f"structure but MLP has {num_classes} — falling back")
-
-    # 3. Generic labels
-    return [f"class_{i}" for i in range(num_classes)], None
+    if len(names) != num_classes:
+        raise ValueError(
+            f"{path} lists {len(names)} classes but the {split} MLP has "
+            f"{num_classes} outputs. Use the class map that matches the split."
+        )
+    return names, f"from {os.path.basename(path)}"
 
 
 # ============================================================
@@ -201,14 +147,14 @@ def load_encoder_models(device: torch.device):
     return visual_encoder, model
 
 
-def load_mlp(strategy: str, split: str, emb_dim: int, device: torch.device):
+def load_mlp(strategy: str, split: str, device: torch.device):
     """
     Load the MLP head from HuggingFace. The MLP repo is structured as:
         <strategy>/best_lab_clf.pt
         <strategy>/best_wild_clf.pt
 
-    We need to know the number of classes ahead of time to build the
-    MLP. We infer it from the saved state_dict.
+    The input size, hidden size and number of classes are all read from the
+    saved state_dict, so nothing here has to be kept in sync by hand.
     """
     filename = f"{strategy}/best_{split}_clf.pt"
     print(f"[load] Downloading MLP from {MLP_REPO}/{filename}")
@@ -217,19 +163,14 @@ def load_mlp(strategy: str, split: str, emb_dim: int, device: torch.device):
     )
     state_dict = torch.load(mlp_path, map_location=device)
 
-    # The final classification layer is the last entry in `net`. Its
-    # output dimension equals the number of classes.
-    final_layer_key = next(
-        k for k in reversed(list(state_dict.keys())) if k.endswith(".weight")
-    )
-    num_classes = state_dict[final_layer_key].shape[0]
+    hidden_dim, input_dim = state_dict["net.0.weight"].shape
+    num_classes = state_dict["net.4.weight"].shape[0]
     print(f"[load] MLP has {num_classes} output classes")
 
     clf = MLP(
-        input_dim=emb_dim,
-        hidden_dim=HIDDEN_DIM,
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
         num_classes=num_classes,
-        dropout=DROPOUT,
     ).to(device).eval()
     clf.load_state_dict(state_dict)
     return clf, num_classes
@@ -265,11 +206,14 @@ def run_inference(
             memory, _ = encoder_model.encode(vid_emb, src_mask_enc)
             # memory: (1, T_enc, D)
 
-            # MLP expects (B, T, D) and a (B, 1, T) mask
-            T_enc = memory.size(1)
-            mlp_mask = torch.ones((1, 1, T_enc), dtype=torch.bool, device=device)
-            logits, _ = classifier(memory, mlp_mask)
-            probs = torch.softmax(logits.float(), dim=-1).squeeze(0).cpu()
+        # The head runs in fp32, outside autocast. In training it learned from
+        # encoder outputs saved as float32 and was trained in float32, so this
+        # is the precision it was fitted at.
+        memory = memory.float()
+        T_enc = memory.size(1)
+        mlp_mask = torch.ones((1, 1, T_enc), dtype=torch.bool, device=device)
+        logits, _ = classifier(memory, mlp_mask)
+        probs = torch.softmax(logits, dim=-1).squeeze(0).cpu()
 
     top_probs, top_idx = probs.topk(min(top_k, probs.size(0)))
     return [(int(i), float(p)) for i, p in zip(top_idx.tolist(), top_probs.tolist())]
@@ -303,9 +247,8 @@ def main():
     )
     parser.add_argument(
         "--class_map", type=str, default=None,
-        help="Optional path to a JSON file mapping class indices to words "
-             "(e.g., {\"0\": \"buna\", \"1\": \"ziua\", ...}). If absent, "
-             "predictions are shown as 'class_<i>'.",
+        help="Optional JSON mapping words to class indices. Defaults to the "
+             "file bundled for the chosen split.",
     )
     parser.add_argument(
         "--device", type=str, default=None,
@@ -325,17 +268,7 @@ def main():
 
     # Load models
     visual_encoder, encoder_model = load_encoder_models(device)
-
-    # We need EMB_DIM to build the MLP — get it via a dummy forward pass
-    dummy_input = torch.zeros((1, 3, 25, 96, 96), device=device)
-    with torch.no_grad():
-        dummy_emb = visual_encoder(dummy_input)
-        B, T, _ = dummy_emb.size()
-        dummy_mask = torch.ones((B, 1, T), device=device).bool()
-        dummy_mem, _ = encoder_model.encode(dummy_emb, dummy_mask)
-    emb_dim = dummy_mem.size(-1)
-
-    classifier, num_classes = load_mlp(args.strategy, args.split, emb_dim, device)
+    classifier, num_classes = load_mlp(args.strategy, args.split, device)
 
     # Detect mismatch between clip dataset and selected split (warning shown
     # AFTER inference so it's not lost in the download logs)
@@ -345,15 +278,12 @@ def main():
     elif "Wild_LRRo" in args.clip_dir and args.split != "wild":
         split_mismatch = "wild"
 
-    # Resolve class names (explicit map → auto-detect → generic fallback)
     class_names, source = resolve_class_names(
         num_classes=num_classes,
         split=args.split,
-        clip_dir=args.clip_dir,
         class_map_file=args.class_map,
     )
-    if source:
-        print(f"[load] Class names {source}")
+    print(f"[load] Class names {source}")
 
     # Run inference
     print("[infer] Running inference ...")

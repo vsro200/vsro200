@@ -11,7 +11,7 @@ To evaluate the cross-domain transferability of our encoder representations to t
 LRRo (Jitaru et al., 2020) must be obtained directly from the official
 source. We provide only the **inference code** and the **trained MLP
 heads**; the dataset itself remains the property of its authors
-(Jitaru, Abdulamit, and Ionescu — University Politehnica of Bucharest).
+(Jitaru, Abdulamit, and Ionescu, University Politehnica of Bucharest).
 
 ```bash
 sudo apt-get install -y unrar
@@ -68,7 +68,7 @@ Expected output:
 [load] Downloading VSR encoder from vsro200/models-vsro200/checkpoints/model_200h_auto.pt
 [load] Downloading MLP from vsro200/mlp-lrro-vsro200/64_bottom/best_wild_clf.pt
 [load] MLP has 21 output classes
-[load] Class names auto-detected from LRRo folder structure
+[load] Class names from lrro_wild_classes.json
 [infer] Running inference ...
 [video] Frames extracted: (1, 3, 29, 96, 96)
 ──────────────────────────────────────────────────────────────────────
@@ -85,8 +85,17 @@ Top-5 predictions:
 ──────────────────────────────────────────────────────────────────────
 ```
 
-Class names are auto-detected from the LRRo folder structure when
-the clip path is inside an LRRo dataset tree.
+If the clip folder sits inside its word folder, as in LRRo, the true
+label is shown and marked in the list.
+
+### Class names
+
+The MLP outputs class indices. The words they stand for are stored in
+`lrro_lab_classes.json` (48 classes) and `lrro_wild_classes.json`
+(21 classes), each including a `distractor` class. The order is the one
+used in training: the word folders of LRRo's train, val and test splits,
+sorted alphabetically. Because the mapping ships with the code, the labels
+do not depend on where or how LRRo is stored locally.
 
 ## Configuration
 
@@ -97,7 +106,7 @@ strategies, each with separate heads for the LAB and WILD splits.
 ### Preprocessing strategies
 
 LRRo provides 64x64 grayscale mouth crops. Our VTP encoder expects
-96x96 RGB face-like inputs. We tested three strategies for adapting
+96x96 RGB face-like inputs. We tested four strategies for adapting
 LRRo frames to this input format:
 
 | Strategy | Description |
@@ -105,6 +114,9 @@ LRRo frames to this input format:
 | `96_resize` | Resize directly to 96x96 |
 | `64_middle` | Keep 64x64, place exactly center on 96x96 gray canvas |
 | `64_bottom` | Keep 64x64, place center-bottom on 96x96 gray canvas |
+| `48_bottom` | Downscale to 48x48, place center-bottom on 96x96 gray canvas |
+
+`64_bottom` performs best and is the default.
 
 
 
@@ -112,12 +124,12 @@ LRRo frames to this input format:
 
 ```
 --clip_dir   Folder containing the clip's .jpg frames (required)
---strategy   64_bottom | 64_middle | 96_resize  (default: 64_bottom)
+--strategy   64_bottom | 64_middle | 96_resize | 48_bottom  (default: 64_bottom)
 --split      lab | wild  (default: lab)
               - lab: MLP for LRRo Lab subset (48 classes)
               - wild: MLP for LRRo Wild subset (21 classes)
 --top_k      Number of top predictions to display (default: 5)
---class_map  Optional JSON {class_idx: word_label} (auto-detected by default)
+--class_map  Optional JSON {word: class_idx} (default: the bundled file for --split)
 --device     cuda | cpu (default: auto-detect)
 ```
 
@@ -148,7 +160,8 @@ All trained MLP heads are available on HuggingFace:
 [vsro200/mlp-lrro-vsro200](https://huggingface.co/vsro200/mlp-lrro-vsro200)
 
 ```
-ro_vsr_classification_mlps/
+vsro200/mlp-lrro-vsro200/
+├── 48_bottom/{best_lab_clf.pt, best_wild_clf.pt}
 ├── 64_bottom/{best_lab_clf.pt, best_wild_clf.pt}
 ├── 64_middle/{best_lab_clf.pt, best_wild_clf.pt}
 └── 96_resize/{best_lab_clf.pt, best_wild_clf.pt}
